@@ -1,6 +1,6 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 
-const MEMORY_DIR = ".opencode/memory"
+let MEMORY_DIR = ".opencode/memory"
 
 const getMemoryFile = () => {
   const date = new Date().toISOString().split("T")[0]
@@ -345,6 +345,7 @@ const forget = tool({
 })
 
 export const MemoryPlugin: Plugin = async (_ctx) => {
+  MEMORY_DIR = `${_ctx.directory}/.opencode/memory`
   return {
     tool: {
       memory_remember: remember,
