@@ -1,18 +1,13 @@
+import os from "node:os"
+import path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
+import { stat } from "node:fs/promises"
 
-let MEMORY_DIR = ".opencode/memory"
+let PROJECT_MEMORY_DIR = ".opencode/memory"
+let GLOBAL_MEMORY_DIR = path.join(os.homedir(), ".config", "opencode", "memory")
 
-const getMemoryFile = () => {
-  const date = new Date().toISOString().split("T")[0]
-  return Bun.file(`${MEMORY_DIR}/${date}.logfmt`)
-}
-
-const ensureDir = async () => {
-  const dir = Bun.file(MEMORY_DIR)
-  if (!(await dir.exists())) {
-    await Bun.$`mkdir -p ${MEMORY_DIR}`
-  }
-}
+const USER_SCOPE = "user"
+const DELETIONS_FILE = "deletions.logfmt"
 
 interface Memory {
   ts: string
@@ -21,6 +16,39 @@ interface Memory {
   content: string
   issue?: string
   tags?: string[]
+}
+
+const getDirForScope = (scope?: string) => {
+  return scope === USER_SCOPE ? GLOBAL_MEMORY_DIR : PROJECT_MEMORY_DIR
+}
+
+const getSearchDirs = (scope?: string) => {
+  if (scope === USER_SCOPE) return [GLOBAL_MEMORY_DIR]
+  if (scope) return [PROJECT_MEMORY_DIR]
+
+  // Unscoped recall/list searches both global user memory and project memory
+  return [...new Set([GLOBAL_MEMORY_DIR, PROJECT_MEMORY_DIR])]
+}
+
+const dirExists = async (dirPath: string) => {
+  try {
+    const s = await stat(dirPath)
+    return s.isDirectory()
+  } catch {
+    return false
+  }
+}
+
+const ensureDir = async (scope?: string) => {
+  const dirPath = getDirForScope(scope)
+  if (!(await dirExists(dirPath))) {
+    await Bun.$`mkdir -p ${dirPath}`
+  }
+}
+
+const getMemoryFile = (scope?: string) => {
+  const date = new Date().toISOString().split("T")[0]
+  return Bun.file(path.join(getDirForScope(scope), `${date}.logfmt`))
 }
 
 const parseLine = (line: string): Memory | null => {
@@ -51,7 +79,9 @@ const formatMemory = (m: Memory): string => {
 }
 
 const scoreMatch = (memory: Memory, words: string[]): number => {
-  const searchable = `${memory.type} ${memory.scope} ${memory.content} ${memory.tags?.join(" ") || ""}`.toLowerCase()
+  const searchable =
+    `${memory.type} ${memory.scope} ${memory.content} ${memory.tags?.join(" ") || ""}`.toLowerCase()
+
   let score = 0
   for (const word of words) {
     if (searchable.includes(word)) score++
@@ -61,19 +91,71 @@ const scoreMatch = (memory: Memory, words: string[]): number => {
   return score
 }
 
+const readMemoriesFromDir = async (dirPath: string): Promise<Memory[]> => {
+  if (!(await dirExists(dirPath))) return []
+
+  const glob = new Bun.Glob("*.logfmt")
+  const files = await Array.fromAsync(glob.scan(dirPath))
+
+  if (!files.length) return []
+
+  const lines: string[] = []
+  for (const filename of files) {
+    if (filename === DELETIONS_FILE) continue
+
+    const file = Bun.file(path.join(dirPath, filename))
+    const text = await file.text()
+    const trimmed = text.trim()
+    if (!trimmed) continue
+
+    lines.push(...trimmed.split("\n").filter(Boolean))
+  }
+
+  return lines.map(parseLine).filter((m): m is Memory => m !== null)
+}
+
+const getAllMemories = async (scope?: string): Promise<Memory[]> => {
+  const dirs = getSearchDirs(scope)
+  const all = await Promise.all(dirs.map(readMemoriesFromDir))
+
+  return all
+    .flat()
+    .sort((a, b) => a.ts.localeCompare(b.ts))
+}
+
+const logDeletion = async (memory: Memory, reason: string) => {
+  await ensureDir(memory.scope)
+
+  const dirPath = getDirForScope(memory.scope)
+  const file = Bun.file(path.join(dirPath, DELETIONS_FILE))
+
+  const ts = new Date().toISOString()
+  const content = memory.content.replace(/"/g, '\\"')
+  const originalTs = memory.ts
+  const issue = memory.issue ? ` issue=${memory.issue}` : ""
+  const tags = memory.tags?.length ? ` tags=${memory.tags.join(",")}` : ""
+  const escapedReason = reason.replace(/"/g, '\\"')
+
+  const line =
+    `ts=${ts} action=deleted original_ts=${originalTs} type=${memory.type} scope=${memory.scope} content="${content}" reason="${escapedReason}"${issue}${tags}\n`
+
+  const existing = (await file.exists()) ? await file.text() : ""
+  await Bun.write(file, existing + line)
+}
+
 const remember = tool({
   description: "Store a memory (decision, learning, preference, blocker, context, pattern)",
   args: {
     type: tool.schema
       .enum(["decision", "learning", "preference", "blocker", "context", "pattern"])
       .describe("Type of memory"),
-    scope: tool.schema.string().describe("Scope/area (e.g., auth, api, mobile)"),
+    scope: tool.schema.string().describe("Scope/area (e.g., user, auth, api, mobile)"),
     content: tool.schema.string().describe("The memory content"),
     issue: tool.schema.string().optional().describe("Related GitHub issue (e.g., #51)"),
     tags: tool.schema.array(tool.schema.string()).optional().describe("Additional tags"),
   },
   async execute(args) {
-    await ensureDir()
+    await ensureDir(args.scope)
 
     const ts = new Date().toISOString()
     const issue = args.issue ? ` issue=${args.issue}` : ""
@@ -81,45 +163,13 @@ const remember = tool({
     const content = args.content.replace(/"/g, '\\"')
     const line = `ts=${ts} type=${args.type} scope=${args.scope} content="${content}"${issue}${tags}\n`
 
-    const file = getMemoryFile()
+    const file = getMemoryFile(args.scope)
     const existing = (await file.exists()) ? await file.text() : ""
     await Bun.write(file, existing + line)
 
     return `Remembered: ${args.type} in ${args.scope}`
   },
 })
-
-const getAllMemories = async (): Promise<Memory[]> => {
-  const glob = new Bun.Glob("*.logfmt")
-  const files = await Array.fromAsync(glob.scan(MEMORY_DIR))
-
-  if (!files.length) return []
-
-  const lines: string[] = []
-  for (const filename of files) {
-    if (filename === "deletions.logfmt") continue // skip audit log
-    const file = Bun.file(`${MEMORY_DIR}/${filename}`)
-    const text = await file.text()
-    lines.push(...text.trim().split("\n").filter(Boolean))
-  }
-
-  return lines.map(parseLine).filter((m): m is Memory => m !== null)
-}
-
-const logDeletion = async (memory: Memory, reason: string) => {
-  await ensureDir()
-  const ts = new Date().toISOString()
-  const content = memory.content.replace(/"/g, '\\"')
-  const originalTs = memory.ts
-  const issue = memory.issue ? ` issue=${memory.issue}` : ""
-  const tags = memory.tags?.length ? ` tags=${memory.tags.join(",")}` : ""
-  const escapedReason = reason.replace(/"/g, '\\"')
-  const line = `ts=${ts} action=deleted original_ts=${originalTs} type=${memory.type} scope=${memory.scope} content="${content}" reason="${escapedReason}"${issue}${tags}\n`
-
-  const file = Bun.file(`${MEMORY_DIR}/deletions.logfmt`)
-  const existing = (await file.exists()) ? await file.text() : ""
-  await Bun.write(file, existing + line)
-}
 
 const recall = tool({
   description: "Retrieve memories by scope, type, or search query",
@@ -133,7 +183,7 @@ const recall = tool({
     limit: tool.schema.number().optional().describe("Max results (default 20)"),
   },
   async execute(args) {
-    let results = await getAllMemories()
+    let results = await getAllMemories(args.scope)
 
     if (!results.length) return "No memories found"
 
@@ -142,6 +192,7 @@ const recall = tool({
     if (args.scope) {
       results = results.filter((m) => m.scope === args.scope || m.scope.includes(args.scope!))
     }
+
     if (args.type) {
       results = results.filter((m) => m.type === args.type)
     }
@@ -151,7 +202,8 @@ const recall = tool({
       const scored = results
         .map((m) => ({ memory: m, score: scoreMatch(m, words) }))
         .filter((x) => x.score > 0)
-        .sort((a, b) => b.score - a.score)
+        .sort((a, b) => b.score - a.score || a.memory.ts.localeCompare(b.memory.ts))
+
       results = scored.map((x) => x.memory)
     }
 
@@ -161,11 +213,12 @@ const recall = tool({
 
     if (!limited.length) return "No matching memories"
 
-    const header = filteredCount > limit
-      ? `Found ${filteredCount} memories (showing last ${limit} of ${totalCount} total)\n\n`
-      : filteredCount !== totalCount
-        ? `Found ${filteredCount} memories (${totalCount} total)\n\n`
-        : `Found ${filteredCount} memories\n\n`
+    const header =
+      filteredCount > limit
+        ? `Found ${filteredCount} memories (showing last ${limit} of ${totalCount} total)\n\n`
+        : filteredCount !== totalCount
+          ? `Found ${filteredCount} memories (${totalCount} total)\n\n`
+          : `Found ${filteredCount} memories\n\n`
 
     return header + limited.map(formatMemory).join("\n")
   },
@@ -184,17 +237,19 @@ const update = tool({
     tags: tool.schema.array(tool.schema.string()).optional().describe("Update tags"),
   },
   async execute(args) {
-    const glob = new Bun.Glob("*.logfmt")
-    const files = await Array.fromAsync(glob.scan(MEMORY_DIR))
+    const dirPath = getDirForScope(args.scope)
+    if (!(await dirExists(dirPath))) return "No memory files found"
 
+    const glob = new Bun.Glob("*.logfmt")
+    const files = await Array.fromAsync(glob.scan(dirPath))
     if (!files.length) return "No memory files found"
 
-    // Find matching memories
     const matches: { memory: Memory; filepath: string; lineIndex: number }[] = []
 
     for (const filename of files) {
-      if (filename === "deletions.logfmt") continue
-      const filepath = `${MEMORY_DIR}/${filename}`
+      if (filename === DELETIONS_FILE) continue
+
+      const filepath = path.join(dirPath, filename)
       const file = Bun.file(filepath)
       const text = await file.text()
       const lines = text.split("\n")
@@ -212,19 +267,20 @@ const update = tool({
       return `No memories found for ${args.type} in ${args.scope}`
     }
 
-    // If multiple matches and query provided, filter by query
     let target: typeof matches[number] | undefined = matches[0]
+
     if (matches.length > 1) {
       if (args.query) {
         const words = args.query.toLowerCase().split(/\s+/).filter(Boolean)
         const scored = matches
           .map((m) => ({ ...m, score: scoreMatch(m.memory, words) }))
           .filter((x) => x.score > 0)
-          .sort((a, b) => b.score - a.score)
+          .sort((a, b) => b.score - a.score || a.memory.ts.localeCompare(b.memory.ts))
 
         if (scored.length === 0) {
           return `Found ${matches.length} memories for ${args.type}/${args.scope}, but none matched query "${args.query}". Use recall to see all matches.`
         }
+
         target = scored[0]
       } else {
         return `Found ${matches.length} memories for ${args.type}/${args.scope}. Provide a query to select which one to update, or use recall to see all matches.`
@@ -235,10 +291,8 @@ const update = tool({
       return `No memories found for ${args.type} in ${args.scope}`
     }
 
-    // Log the old version before updating
     await logDeletion(target.memory, `Updated to: ${args.content}`)
 
-    // Update the memory
     const file = Bun.file(target.filepath)
     const text = await file.text()
     const lines = text.split("\n")
@@ -273,6 +327,7 @@ const listMemories = tool({
     for (const m of memories) {
       scopes.set(m.scope, (scopes.get(m.scope) || 0) + 1)
       types.set(m.type, (types.get(m.type) || 0) + 1)
+
       if (!scopeTypes.has(m.scope)) scopeTypes.set(m.scope, new Set())
       scopeTypes.get(m.scope)!.add(m.type)
     }
@@ -281,12 +336,15 @@ const listMemories = tool({
     lines.push(`Total memories: ${memories.length}`)
     lines.push("")
     lines.push("Scopes:")
+
     for (const [scope, count] of [...scopes.entries()].sort((a, b) => b[1] - a[1])) {
       const typeList = [...scopeTypes.get(scope)!].join(", ")
       lines.push(`  ${scope}: ${count} (${typeList})`)
     }
+
     lines.push("")
     lines.push("Types:")
+
     for (const [type, count] of [...types.entries()].sort((a, b) => b[1] - a[1])) {
       lines.push(`  ${type}: ${count}`)
     }
@@ -305,47 +363,58 @@ const forget = tool({
     reason: tool.schema.string().describe("Why this is being deleted (for audit purposes)"),
   },
   async execute(args) {
-    const glob = new Bun.Glob("*.logfmt")
-    const files = await Array.fromAsync(glob.scan(MEMORY_DIR))
+    const dirPath = getDirForScope(args.scope)
+    if (!(await dirExists(dirPath))) return "No memory files found"
 
+    const glob = new Bun.Glob("*.logfmt")
+    const files = await Array.fromAsync(glob.scan(dirPath))
     if (!files.length) return "No memory files found"
 
     let deleted = 0
     const deletedMemories: Memory[] = []
 
     for (const filename of files) {
-      if (filename === "deletions.logfmt") continue // skip audit log
-      const filepath = `${MEMORY_DIR}/${filename}`
+      if (filename === DELETIONS_FILE) continue
+
+      const filepath = path.join(dirPath, filename)
       const file = Bun.file(filepath)
       const text = await file.text()
       const lines = text.split("\n")
+
       const filtered = lines.filter((line) => {
         const memory = parseLine(line)
         if (!memory) return true
+
         if (memory.scope === args.scope && memory.type === args.type) {
           deleted++
           deletedMemories.push(memory)
           return false
         }
+
         return true
       })
+
       if (filtered.length !== lines.length) {
         await Bun.write(filepath, filtered.join("\n"))
       }
     }
 
-    // Log all deletions to audit file
     for (const memory of deletedMemories) {
       await logDeletion(memory, args.reason)
     }
 
-    if (deleted === 0) return `No memories found for ${args.type} in ${args.scope}`
-    return `Deleted ${deleted} ${args.type} memory(s) from ${args.scope}. Reason: ${args.reason}\nDeletions logged to ${MEMORY_DIR}/deletions.logfmt`
+    if (deleted === 0) {
+      return `No memories found for ${args.type} in ${args.scope}`
+    }
+
+    return `Deleted ${deleted} ${args.type} memory(s) from ${args.scope}. Reason: ${args.reason}\nDeletions logged to ${path.join(dirPath, DELETIONS_FILE)}`
   },
 })
 
 export const MemoryPlugin: Plugin = async (_ctx) => {
-  MEMORY_DIR = `${_ctx.directory}/.opencode/memory`
+  PROJECT_MEMORY_DIR = path.join(_ctx.directory, ".opencode", "memory")
+  GLOBAL_MEMORY_DIR = path.join(os.homedir(), ".config", "opencode", "memory")
+
   return {
     tool: {
       memory_remember: remember,
